@@ -1,0 +1,6 @@
+celery[redis]==5.4.0
+fastapi==0.115.11
+pydantic==2.11.1
+pydantic-settings==2.8.1
+redis==5.2.1
+uvicorn[standard]==0.34.0

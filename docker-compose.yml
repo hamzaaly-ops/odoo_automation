@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: odoo-automation-redis
+    ports:
+      - "6379:6379"
+
+  timesheet-api:
+    build:
+      context: ./services/timesheet-service
+    container_name: odoo-timesheet-api
+    env_file:
+      - ./services/timesheet-service/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  timesheet-worker:
+    build:
+      context: ./services/timesheet-service
+    container_name: odoo-timesheet-worker
+    env_file:
+      - ./services/timesheet-service/.env
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info
+
+  timesheet-beat:
+    build:
+      context: ./services/timesheet-service
+    container_name: odoo-timesheet-beat
+    env_file:
+      - ./services/timesheet-service/.env
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
