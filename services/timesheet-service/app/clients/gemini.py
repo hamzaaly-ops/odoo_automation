@@ -122,6 +122,7 @@ Return ONLY valid JSON with this exact shape:
 Rules:
 - Never return markdown.
 - Never invent employee/project/task/user IDs.
+- If only a name is available, use employee_name/project_name/task_name fields.
 - If user mentions a date naturally, convert to YYYY-MM-DD.
 - For weekdays in fill_week, use integers where Monday=0 and Sunday=6.
 - If this is just a normal chat question, use action="none".

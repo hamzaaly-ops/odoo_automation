@@ -110,6 +110,9 @@ curl -X POST http://localhost:8000/api/v1/chat/query \
 ```
 
 The API will return a `session_id` and ask for missing fields (like `employee_id`, `project_id`, `task_id`).
+Use that exact `session_id` for every follow-up message in the same conversation.
+You can also provide names (for example project/task/employee names), and the service will try to resolve them to IDs.
+If names are misspelled, it applies fuzzy matching against your Odoo projects/tasks and uses the highest-confidence match.
 
 Follow-up using same session:
 

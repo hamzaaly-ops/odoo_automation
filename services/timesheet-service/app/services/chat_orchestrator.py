@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date as dt_date
+from datetime import date as dt_date, timedelta
+import re
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -97,9 +98,12 @@ class ChatOrchestratorService:
         llm_result = self._llm_client.extract_action(message, state)
         action = llm_result.action
         incoming_fields = self._normalize_fields(llm_result.fields)
+        heuristic_fields = self._normalize_fields(self._extract_fields_from_message(message))
+        incoming_fields = self._merge_prefer_existing(incoming_fields, heuristic_fields)
 
         pending_action = state.get("pending_action")
         pending_fields = state.get("fields") or {}
+        pending_hints = state.get("field_hints") or {}
 
         if action == "none" and pending_action and incoming_fields:
             action = pending_action
@@ -108,13 +112,18 @@ class ChatOrchestratorService:
             if pending_action:
                 merged_fields = dict(pending_fields)
                 missing_fields = self._get_missing_fields(pending_action, merged_fields)
-                question = self._build_follow_up_question(pending_action, missing_fields)
+                question = self._build_follow_up_question(
+                    pending_action,
+                    missing_fields,
+                    pending_hints,
+                )
                 self._session_store.save_state(
                     session_id,
                     {
                         "pending_action": pending_action,
                         "fields": merged_fields,
                         "missing_fields": missing_fields,
+                        "field_hints": pending_hints,
                     },
                 )
                 return ChatQueryResponse(
@@ -150,16 +159,25 @@ class ChatOrchestratorService:
             merged_fields = dict(pending_fields)
 
         merged_fields.update(incoming_fields)
+        merged_fields = self._normalize_fields(merged_fields)
+        merged_fields, field_hints = self._resolve_reference_fields(action, merged_fields)
 
         missing_fields = self._get_missing_fields(action, merged_fields)
+        field_hints = self._augment_field_hints(
+            action=action,
+            fields=merged_fields,
+            missing_fields=missing_fields,
+            field_hints=field_hints,
+        )
         if missing_fields:
-            question = self._build_follow_up_question(action, missing_fields)
+            question = self._build_follow_up_question(action, missing_fields, field_hints)
             self._session_store.save_state(
                 session_id,
                 {
                     "pending_action": action,
                     "fields": merged_fields,
                     "missing_fields": missing_fields,
+                    "field_hints": field_hints,
                 },
             )
             return ChatQueryResponse(
@@ -179,6 +197,7 @@ class ChatOrchestratorService:
                     "pending_action": action,
                     "fields": merged_fields,
                     "missing_fields": [],
+                    "field_hints": field_hints,
                 },
             )
             return ChatQueryResponse(
@@ -273,6 +292,15 @@ class ChatOrchestratorService:
     def _normalize_fields(fields: dict) -> dict:
         normalized = dict(fields or {})
 
+        alias_fields = {
+            "employee": "employee_name",
+            "project": "project_name",
+            "task": "task_name",
+        }
+        for alias_key, canonical_key in alias_fields.items():
+            if alias_key in normalized and canonical_key not in normalized:
+                normalized[canonical_key] = normalized[alias_key]
+
         int_fields = {
             "employee_id",
             "project_id",
@@ -318,6 +346,191 @@ class ChatOrchestratorService:
                     normalized[key] = parsed_days
 
         return normalized
+
+    @staticmethod
+    def _merge_prefer_existing(primary: dict, secondary: dict) -> dict:
+        merged = dict(primary)
+        for key, value in (secondary or {}).items():
+            if key not in merged or merged[key] in (None, "", []):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _extract_fields_from_message(message: str) -> dict:
+        text = message.strip()
+        lowered = text.lower()
+        extracted: dict = {}
+
+        iso_date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        if iso_date_match:
+            extracted["date"] = iso_date_match.group(1)
+
+        week_start_match = re.search(r"\bweek(?:_start| start)\s*(?:is|=|:)?\s*(\d{4}-\d{2}-\d{2})\b", lowered)
+        if week_start_match:
+            extracted["week_start"] = week_start_match.group(1)
+
+        today = dt_date.today()
+        if "date" not in extracted:
+            if re.search(r"\byesterday\b", lowered):
+                extracted["date"] = (today - timedelta(days=1)).isoformat()
+            elif re.search(r"\btoday\b", lowered):
+                extracted["date"] = today.isoformat()
+            elif re.search(r"\btomorrow\b", lowered):
+                extracted["date"] = (today + timedelta(days=1)).isoformat()
+
+        hours_match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr|h)\b", lowered)
+        if hours_match:
+            extracted["hours"] = float(hours_match.group(1))
+
+        entry_match = re.search(r"\b(?:entry|timesheet)\s*(?:id)?\s*(?:is|=|:)?\s*(\d+)\b", lowered)
+        if entry_match:
+            extracted["entry_id"] = int(entry_match.group(1))
+
+        chunks = re.split(r"[,\n;]|\band\b", text, flags=re.IGNORECASE)
+        for chunk in chunks:
+            segment = chunk.strip().strip(".")
+            if not segment:
+                continue
+
+            key_match = re.match(
+                r"^(employee|project|task|user|description)\s*(?:id)?\s*(?:is|=|:)?\s*(.+)$",
+                segment,
+                flags=re.IGNORECASE,
+            )
+            if not key_match:
+                continue
+
+            key = key_match.group(1).lower()
+            value = key_match.group(2).strip().strip(".")
+            value = re.sub(r"^(?:to\s+)+", "", value, flags=re.IGNORECASE)
+            if not value:
+                continue
+
+            if key == "description":
+                extracted["description"] = value
+                continue
+
+            id_key = f"{key}_id"
+            name_key = f"{key}_name"
+            if value.isdigit():
+                extracted[id_key] = int(value)
+            else:
+                extracted[name_key] = value
+
+        return extracted
+
+    def _resolve_reference_fields(
+        self,
+        action: str,
+        fields: dict,
+    ) -> tuple[dict, dict[str, list[str]]]:
+        resolved = dict(fields)
+        hints: dict[str, list[str]] = {}
+
+        def resolve_field(
+            field_key: str,
+            name_keys: list[str],
+            resolver,
+            resolver_kwargs: dict | None = None,
+        ) -> None:
+            value = resolved.get(field_key)
+            if isinstance(value, int):
+                return
+
+            lookup = None
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.isdigit():
+                    resolved[field_key] = int(stripped)
+                    return
+                if stripped:
+                    lookup = stripped
+
+            if lookup is None:
+                for name_key in name_keys:
+                    candidate = resolved.get(name_key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        lookup = candidate.strip()
+                        break
+
+            if not lookup:
+                return
+
+            args = resolver_kwargs or {}
+            resolved_id, candidates = resolver(lookup, **args)
+            if resolved_id is not None:
+                resolved[field_key] = resolved_id
+                return
+
+            formatted = self._format_candidates(candidates)
+            if formatted:
+                hints[field_key] = formatted
+
+        resolve_field(
+            "employee_id",
+            ["employee_name", "employee"],
+            self._timesheet_service.resolve_employee_id,
+        )
+
+        resolve_field(
+            "project_id",
+            ["project_name", "project"],
+            self._timesheet_service.resolve_project_id,
+        )
+
+        project_id = resolved.get("project_id")
+        task_resolver_kwargs = {}
+        if isinstance(project_id, int):
+            task_resolver_kwargs["project_id"] = project_id
+
+        resolve_field(
+            "task_id",
+            ["task_name", "task"],
+            self._timesheet_service.resolve_task_id,
+            task_resolver_kwargs,
+        )
+
+        if action == "fill_week" and "daily_hours" not in resolved and "hours" in resolved:
+            resolved["daily_hours"] = resolved.get("hours")
+
+        return resolved, hints
+
+    def _augment_field_hints(
+        self,
+        action: str,
+        fields: dict,
+        missing_fields: list[str],
+        field_hints: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        if "project_id" in missing_fields and "project_id" not in field_hints:
+            project_suggestions = self._timesheet_service.suggest_projects()
+            if project_suggestions:
+                field_hints = dict(field_hints)
+                field_hints["project_id"] = project_suggestions
+
+        if "task_id" in missing_fields:
+            project_id = fields.get("project_id")
+            if isinstance(project_id, int) and "task_id" not in field_hints:
+                suggestions = self._timesheet_service.suggest_tasks_for_project(project_id)
+                if suggestions:
+                    field_hints = dict(field_hints)
+                    field_hints["task_id"] = suggestions
+
+        return field_hints
+
+    @staticmethod
+    def _format_candidates(candidates: list[dict], limit: int = 8) -> list[str]:
+        formatted: list[str] = []
+        for candidate in candidates[:limit]:
+            rec_id = candidate.get("id")
+            name = candidate.get("name")
+            if rec_id is None:
+                continue
+            if name:
+                formatted.append(f"{rec_id}: {name}")
+            else:
+                formatted.append(str(rec_id))
+        return formatted
 
     @staticmethod
     def _to_int(value) -> int | None:
@@ -375,7 +588,11 @@ class ChatOrchestratorService:
         return missing
 
     @staticmethod
-    def _build_follow_up_question(action: str, missing_fields: list[str]) -> str:
+    def _build_follow_up_question(
+        action: str,
+        missing_fields: list[str],
+        field_hints: dict[str, list[str]] | None = None,
+    ) -> str:
         action_label = ACTION_LABELS.get(action, action)
         prompts = [FIELD_PROMPTS.get(field, field) for field in missing_fields]
 
@@ -383,4 +600,21 @@ class ChatOrchestratorService:
             return "Please provide the missing details to continue."
 
         joined = ", ".join(prompts)
-        return f"To {action_label}, I still need: {joined}."
+        message = (
+            f"To {action_label}, I still need: {joined}. "
+            "Reply with the same session_id to continue this thread."
+        )
+
+        if not field_hints:
+            return message
+
+        hint_parts = []
+        for field in missing_fields:
+            hints = field_hints.get(field)
+            if hints:
+                hint_parts.append(f"{field}: {', '.join(hints)}")
+
+        if not hint_parts:
+            return message
+
+        return f"{message} I found these matches: {' | '.join(hint_parts)}."

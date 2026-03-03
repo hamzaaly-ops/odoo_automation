@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import difflib
 from datetime import timedelta
+import re
 
 from app.clients.odoo import OdooClient
 from app.models.schemas import (
@@ -113,6 +115,231 @@ class OdooTimesheetService:
             updated_entry_ids=updated_entry_ids,
             skipped_dates=skipped_dates,
         )
+
+    def resolve_project_id(self, query: str) -> tuple[int | None, list[dict]]:
+        resolved_id, ranked = self._resolve_name_to_id(
+            query=query,
+            candidates=self._client.find_project_candidates(query, limit=25),
+        )
+        if resolved_id is not None:
+            return resolved_id, ranked[:10]
+
+        all_projects = self._client.list_all_projects()
+        resolved_id, ranked_all = self._resolve_name_to_id(query=query, candidates=all_projects)
+        if resolved_id is not None:
+            return resolved_id, ranked_all[:10]
+
+        if ranked:
+            return None, ranked[:10]
+        return None, ranked_all[:10]
+
+    def resolve_employee_id(self, query: str) -> tuple[int | None, list[dict]]:
+        resolved_id, ranked = self._resolve_name_to_id(
+            query=query,
+            candidates=self._client.find_employee_candidates(query, limit=25),
+        )
+        if resolved_id is not None:
+            return resolved_id, ranked[:10]
+
+        all_employees = self._client.list_all_employees()
+        resolved_id, ranked_all = self._resolve_name_to_id(query=query, candidates=all_employees)
+        if resolved_id is not None:
+            return resolved_id, ranked_all[:10]
+
+        if ranked:
+            return None, ranked[:10]
+        return None, ranked_all[:10]
+
+    def resolve_task_id(
+        self,
+        query: str,
+        project_id: int | None = None,
+    ) -> tuple[int | None, list[dict]]:
+        resolved_id, ranked = self._resolve_name_to_id(
+            query=query,
+            candidates=self._client.find_task_candidates(query, project_id=project_id, limit=25),
+        )
+        if resolved_id is not None:
+            return resolved_id, ranked[:10]
+
+        all_tasks = self._client.list_all_tasks(project_id=project_id)
+        resolved_id, ranked_all = self._resolve_name_to_id(query=query, candidates=all_tasks)
+        if resolved_id is not None:
+            return resolved_id, ranked_all[:10]
+
+        if ranked:
+            return None, ranked[:10]
+        return None, ranked_all[:10]
+
+    def suggest_tasks_for_project(self, project_id: int, limit: int = 8) -> list[str]:
+        records = self._client.list_tasks_for_project(project_id, limit=limit)
+        suggestions = []
+        for record in records:
+            rec_id = int(record["id"])
+            name = str(record.get("name") or "")
+            suggestions.append(f"{rec_id}: {name}")
+        return suggestions
+
+    def suggest_projects(self, limit: int = 8) -> list[str]:
+        records = self._client.list_all_projects()
+        suggestions = []
+        for record in records[:limit]:
+            rec_id = int(record["id"])
+            name = str(record.get("name") or "")
+            suggestions.append(f"{rec_id}: {name}")
+        return suggestions
+
+    @staticmethod
+    def _resolve_name_to_id(query: str, candidates: list[dict]) -> tuple[int | None, list[dict]]:
+        if not candidates:
+            return None, []
+
+        normalized_query = OdooTimesheetService._name_keys(query)
+        exact_matches: list[dict] = []
+
+        for candidate in candidates:
+            candidate_name = str(candidate.get("name") or "")
+            candidate_keys = OdooTimesheetService._name_keys(candidate_name)
+            if normalized_query & candidate_keys:
+                exact_matches.append(candidate)
+
+        if len(exact_matches) == 1:
+            best_id = int(exact_matches[0]["id"])
+            ordered = [exact_matches[0]]
+            seen = {best_id}
+            for candidate in candidates:
+                candidate_id = int(candidate["id"])
+                if candidate_id in seen:
+                    continue
+                seen.add(candidate_id)
+                ordered.append(candidate)
+            return best_id, ordered
+
+        scored_candidates: list[tuple[float, dict]] = []
+        for candidate in candidates:
+            candidate_name = str(candidate.get("name") or "")
+            if not candidate_name:
+                continue
+            score = OdooTimesheetService._candidate_score(query, candidate_name)
+            scored_candidates.append((score, candidate))
+
+        if not scored_candidates:
+            return None, []
+
+        scored_candidates.sort(
+            key=lambda item: (item[0], str(item[1].get("name") or "").lower()),
+            reverse=True,
+        )
+        ranked = [item[1] for item in scored_candidates]
+
+        best_score, best_candidate = scored_candidates[0]
+        second_score = scored_candidates[1][0] if len(scored_candidates) > 1 else 0.0
+
+        high_confidence = best_score >= 0.84
+        strong_gap = (best_score - second_score) >= 0.08
+        single_candidate_confident = len(scored_candidates) == 1 and best_score >= 0.75
+        if (high_confidence and strong_gap) or single_candidate_confident:
+            return int(best_candidate["id"]), ranked
+
+        return None, ranked
+
+    @staticmethod
+    def _candidate_score(query: str, candidate_name: str) -> float:
+        query_keys = OdooTimesheetService._name_keys(query)
+        candidate_keys = OdooTimesheetService._name_keys(candidate_name)
+        if not query_keys or not candidate_keys:
+            return 0.0
+
+        best_ratio = 0.0
+        contains_bonus = 0.0
+        for query_key in query_keys:
+            for candidate_key in candidate_keys:
+                ratio = difflib.SequenceMatcher(a=query_key, b=candidate_key).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                if query_key in candidate_key or candidate_key in query_key:
+                    contains_bonus = max(contains_bonus, 1.0)
+
+        query_tokens = OdooTimesheetService._name_tokens(query)
+        candidate_tokens = OdooTimesheetService._name_tokens(candidate_name)
+        token_score = 0.0
+        if query_tokens and candidate_tokens:
+            token_score = len(query_tokens & candidate_tokens) / len(query_tokens)
+
+        score = (best_ratio * 0.70) + (token_score * 0.20) + (contains_bonus * 0.10)
+        return min(1.0, score)
+
+    @staticmethod
+    def _name_keys(value: str) -> set[str]:
+        lowered = value.strip().lower()
+        if not lowered:
+            return set()
+
+        keys: set[str] = set()
+        keys.add(re.sub(r"[^a-z0-9]", "", lowered))
+
+        word_to_digit = {
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+        }
+
+        replaced = lowered
+        for word, digit in word_to_digit.items():
+            replaced = re.sub(rf"\b{word}\b", digit, replaced)
+        keys.add(re.sub(r"[^a-z0-9]", "", replaced))
+
+        for word, digit in word_to_digit.items():
+            if lowered.startswith(word) and len(lowered) > len(word):
+                prefixed = f"{digit}{lowered[len(word):]}"
+                keys.add(re.sub(r"[^a-z0-9]", "", prefixed))
+
+        return {key for key in keys if key}
+
+    @staticmethod
+    def _name_tokens(value: str) -> set[str]:
+        lowered = value.strip().lower()
+        if not lowered:
+            return set()
+
+        lowered = lowered.replace("_", " ").replace("-", " ")
+        raw_tokens = [token for token in re.split(r"\s+", lowered) if token]
+
+        word_to_digit = {
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+        }
+
+        tokens: set[str] = set()
+        for token in raw_tokens:
+            stripped = re.sub(r"[^a-z0-9]", "", token)
+            if stripped:
+                tokens.add(stripped)
+
+            for word, digit in word_to_digit.items():
+                if stripped == word:
+                    tokens.add(digit)
+                if stripped.startswith(word) and len(stripped) > len(word):
+                    tokens.add(f"{digit}{stripped[len(word):]}")
+
+        return tokens
 
     @staticmethod
     def _map_record(record: dict) -> TimesheetRead:

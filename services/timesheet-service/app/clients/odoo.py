@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 import json
 import random
+import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -236,3 +237,221 @@ class OdooClient:
             },
         )
         return list(records)
+
+    def find_project_candidates(self, query: str, limit: int = 10) -> list[dict]:
+        return self._search_name_candidates(
+            model="project.project",
+            query=query,
+            fields=["id", "name"],
+            limit=limit,
+        )
+
+    def find_employee_candidates(self, query: str, limit: int = 10) -> list[dict]:
+        return self._search_name_candidates(
+            model="hr.employee",
+            query=query,
+            fields=["id", "name"],
+            limit=limit,
+        )
+
+    def find_task_candidates(
+        self,
+        query: str,
+        project_id: int | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        base_domain = []
+        if project_id is not None:
+            base_domain.append(["project_id", "=", int(project_id)])
+
+        return self._search_name_candidates(
+            model="project.task",
+            query=query,
+            fields=["id", "name", "project_id"],
+            base_domain=base_domain,
+            limit=limit,
+        )
+
+    def list_tasks_for_project(self, project_id: int, limit: int = 20) -> list[dict]:
+        domain = [["project_id", "=", int(project_id)]]
+        records = self.execute_kw(
+            "project.task",
+            "search_read",
+            [domain],
+            {
+                "fields": ["id", "name", "project_id"],
+                "order": "id asc",
+                "limit": limit,
+            },
+        )
+        return list(records)
+
+    def list_all_projects(self) -> list[dict]:
+        return self._list_all_records(
+            model="project.project",
+            fields=["id", "name"],
+        )
+
+    def list_all_employees(self) -> list[dict]:
+        return self._list_all_records(
+            model="hr.employee",
+            fields=["id", "name"],
+        )
+
+    def list_all_tasks(self, project_id: int | None = None) -> list[dict]:
+        domain = []
+        if project_id is not None:
+            domain.append(["project_id", "=", int(project_id)])
+        return self._list_all_records(
+            model="project.task",
+            fields=["id", "name", "project_id"],
+            domain=domain,
+        )
+
+    def _search_name_candidates(
+        self,
+        model: str,
+        query: str,
+        fields: list[str],
+        base_domain: list | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        variants = self._build_name_variants(query)
+        if not variants:
+            return []
+
+        seen_ids: set[int] = set()
+        merged: list[dict] = []
+
+        for variant in variants:
+            domain = list(base_domain or [])
+            domain.append(["name", "ilike", variant])
+
+            records = self.execute_kw(
+                model,
+                "search_read",
+                [domain],
+                {
+                    "fields": fields,
+                    "order": "id asc",
+                    "limit": limit,
+                },
+            )
+
+            for record in records:
+                rec_id = int(record["id"])
+                if rec_id in seen_ids:
+                    continue
+                seen_ids.add(rec_id)
+                merged.append(record)
+                if len(merged) >= limit:
+                    return merged
+
+        if not merged:
+            # Fallback pool for fuzzy scoring when ilike variants miss due to typos.
+            fallback_limit = max(limit * 6, 60)
+            records = self.execute_kw(
+                model,
+                "search_read",
+                [list(base_domain or [])],
+                {
+                    "fields": fields,
+                    "order": "id desc",
+                    "limit": fallback_limit,
+                },
+            )
+            for record in records:
+                rec_id = int(record["id"])
+                if rec_id in seen_ids:
+                    continue
+                seen_ids.add(rec_id)
+                merged.append(record)
+                if len(merged) >= fallback_limit:
+                    break
+
+        return merged
+
+    def _list_all_records(
+        self,
+        model: str,
+        fields: list[str],
+        domain: list | None = None,
+        batch_size: int = 200,
+    ) -> list[dict]:
+        domain = list(domain or [])
+        ids = self.execute_kw(
+            model,
+            "search",
+            [domain],
+            {
+                "order": "id asc",
+            },
+        )
+        if not ids:
+            return []
+
+        records: list[dict] = []
+        total = len(ids)
+        for idx in range(0, total, batch_size):
+            chunk = ids[idx : idx + batch_size]
+            batch = self.execute_kw(
+                model,
+                "read",
+                [chunk],
+                {
+                    "fields": fields,
+                },
+            )
+            records.extend(batch)
+
+        return records
+
+    @staticmethod
+    def _build_name_variants(query: str) -> list[str]:
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+
+        lowered = cleaned.lower()
+        variants: list[str] = [cleaned]
+
+        compact = re.sub(r"\s+", " ", lowered.replace("_", " ").replace("-", " ")).strip()
+        if compact and compact not in variants:
+            variants.append(compact)
+
+        tokens = [token for token in re.split(r"\s+", compact) if token]
+        for token in tokens:
+            if len(token) >= 2 and token not in variants:
+                variants.append(token)
+
+        word_to_digit = {
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+        }
+
+        replaced = compact
+        for word, digit in word_to_digit.items():
+            replaced = re.sub(rf"\b{word}\b", digit, replaced)
+        if replaced and replaced not in variants:
+            variants.append(replaced)
+
+        for word, digit in word_to_digit.items():
+            if compact.startswith(word) and len(compact) > len(word):
+                prefixed = f"{digit}{compact[len(word):]}".strip()
+                if prefixed and prefixed not in variants:
+                    variants.append(prefixed)
+
+        alnum = re.sub(r"[^a-z0-9]", "", compact)
+        if alnum and alnum not in variants:
+            variants.append(alnum)
+
+        return variants
