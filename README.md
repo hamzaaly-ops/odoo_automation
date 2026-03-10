@@ -58,6 +58,7 @@ API base URL: `http://localhost:8000`
 
 ### Voice
 - `POST /voice` (multipart `file` forwarded to the configured transcription endpoint)
+- `POST /voice/query` (transcribes audio and runs the resulting text through `/api/v1/chat/query`)
 
 ### Automation
 - `POST /api/v1/automation/fill-week` (async, Celery)
