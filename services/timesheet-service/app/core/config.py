@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     odoo_db: str
     odoo_username: str
     odoo_password: str
+    transcription_url: AnyHttpUrl = "https://aqs-shispare-transcript-api.hf.space/voice"
 
     celery_broker_url: str = "redis://redis:6379/0"
     celery_result_backend: str = "redis://redis:6379/1"

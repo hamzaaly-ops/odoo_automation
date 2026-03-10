@@ -15,6 +15,7 @@ class OdooClient:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._uid: int | None = None
+        self._employee_id: int | None = None
         self._jsonrpc_endpoint = f"{settings.odoo_base_url}/jsonrpc"
 
     def authenticate(self) -> int:
@@ -29,7 +30,11 @@ class OdooClient:
             ],
         )
         if not uid:
-            raise RuntimeError("Odoo authentication failed. Check credentials.")
+            raise RuntimeError(
+                "Odoo authentication failed for "
+                f"db='{self._settings.odoo_db}', username='{self._settings.odoo_username}'. "
+                "Verify ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD."
+            )
         self._uid = int(uid)
         return self._uid
 
@@ -37,6 +42,38 @@ class OdooClient:
         if self._uid is None:
             return self.authenticate()
         return self._uid
+
+    def get_current_employee_id(self) -> int:
+        if self._employee_id is not None:
+            return self._employee_id
+
+        uid = self._ensure_uid()
+        resolved_id = self.find_employee_id_by_user_id(uid)
+        if resolved_id is None:
+            raise RuntimeError(
+                "Could not resolve employee_id for authenticated Odoo user "
+                f"uid={uid} ({self._settings.odoo_username}). "
+                "Link this user to an employee record in hr.employee."
+            )
+
+        self._employee_id = int(resolved_id)
+        return self._employee_id
+
+    def find_employee_id_by_user_id(self, user_id: int) -> int | None:
+        records = self.execute_kw(
+            "hr.employee",
+            "search_read",
+            [[["user_id", "=", int(user_id)]]],
+            {
+                "fields": ["id"],
+                "order": "id asc",
+                "limit": 1,
+                "context": {"active_test": False},
+            },
+        )
+        if not records:
+            return None
+        return int(records[0]["id"])
 
     def execute_kw(
         self,
@@ -64,11 +101,16 @@ class OdooClient:
         )
 
     def create_timesheet(self, payload: TimesheetCreate) -> int:
+        employee_id = (
+            int(payload.employee_id)
+            if payload.employee_id is not None
+            else self.get_current_employee_id()
+        )
         values = {
             "name": payload.description,
             "date": payload.date.isoformat(),
             "unit_amount": payload.hours,
-            "employee_id": payload.employee_id,
+            "employee_id": employee_id,
             "project_id": payload.project_id,
             "task_id": payload.task_id,
         }
@@ -136,11 +178,14 @@ class OdooClient:
 
     def list_timesheets(
         self,
-        employee_id: int,
+        employee_id: int | None,
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> list[dict]:
-        domain: list[list[str | int]] = [["employee_id", "=", employee_id]]
+        resolved_employee_id = (
+            int(employee_id) if employee_id is not None else self.get_current_employee_id()
+        )
+        domain: list[list[str | int]] = [["employee_id", "=", resolved_employee_id]]
 
         if date_from is not None:
             domain.append(["date", ">=", date_from.isoformat()])
@@ -166,6 +211,33 @@ class OdooClient:
             },
         )
         return list(records)
+
+    def record_exists(self, model: str, record_id: int) -> bool:
+        domain = [["id", "=", int(record_id)]]
+        count = self.execute_kw(
+            model,
+            "search_count",
+            [domain],
+            {
+                "context": {"active_test": False},
+            },
+        )
+        return int(count) > 0
+
+    def task_belongs_to_project(self, task_id: int, project_id: int) -> bool:
+        domain = [
+            ["id", "=", int(task_id)],
+            ["project_id", "=", int(project_id)],
+        ]
+        count = self.execute_kw(
+            "project.task",
+            "search_count",
+            [domain],
+            {
+                "context": {"active_test": False},
+            },
+        )
+        return int(count) > 0
 
     def _jsonrpc_call(self, service: str, method: str, args: list):
         payload = {
@@ -205,7 +277,10 @@ class OdooClient:
             message = error.get("message", "Unknown Odoo JSON-RPC error")
             data = error.get("data")
             if data:
-                raise RuntimeError(f"Odoo JSON-RPC error: {message} | {data}")
+                formatted_detail = self._format_error_data(data)
+                if formatted_detail:
+                    raise RuntimeError(f"Odoo JSON-RPC error: {formatted_detail}")
+                raise RuntimeError(f"Odoo JSON-RPC error: {message}")
             raise RuntimeError(f"Odoo JSON-RPC error: {message}")
 
         if "result" not in response_json:
@@ -213,15 +288,37 @@ class OdooClient:
 
         return response_json["result"]
 
+    @staticmethod
+    def _format_error_data(data) -> str | None:
+        if isinstance(data, dict):
+            error_name = str(data.get("name") or "").strip()
+            error_message = str(data.get("message") or "").strip()
+            if error_name and error_message:
+                return f"{error_name}: {error_message}"
+            if error_message:
+                return error_message
+            if error_name:
+                return error_name
+            return None
+
+        if data is None:
+            return None
+
+        detail = str(data).strip()
+        return detail or None
+
     def list_entries_for_day(
         self,
-        employee_id: int,
+        employee_id: int | None,
         entry_date: date,
         project_id: int,
         task_id: int,
     ) -> list[dict]:
+        resolved_employee_id = (
+            int(employee_id) if employee_id is not None else self.get_current_employee_id()
+        )
         domain = [
-            ["employee_id", "=", employee_id],
+            ["employee_id", "=", resolved_employee_id],
             ["project_id", "=", project_id],
             ["task_id", "=", task_id],
             ["date", "=", entry_date.isoformat()],

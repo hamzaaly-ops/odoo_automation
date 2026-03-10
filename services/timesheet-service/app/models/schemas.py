@@ -10,7 +10,7 @@ class TimesheetCreate(BaseModel):
     description: str = Field(min_length=1, max_length=512)
     date: dt_date
     hours: float = Field(gt=0, le=24)
-    employee_id: int = Field(gt=0)
+    employee_id: int | None = Field(default=None, gt=0)
     project_id: int = Field(gt=0)
     task_id: int = Field(gt=0)
     user_id: int | None = Field(default=None, gt=0)
@@ -42,7 +42,7 @@ class TimesheetListResponse(BaseModel):
 
 
 class TimesheetFillWeekRequest(BaseModel):
-    employee_id: int = Field(gt=0)
+    employee_id: int | None = Field(default=None, gt=0)
     project_id: int = Field(gt=0)
     task_id: int = Field(gt=0)
     week_start: dt_date

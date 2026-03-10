@@ -29,7 +29,16 @@ class OdooTimesheetService:
         self._client = client
 
     def create_timesheet(self, payload: TimesheetCreate) -> TimesheetRead:
-        entry_id = self._client.create_timesheet(payload)
+        resolved_employee_id = self._resolve_employee_id(payload.employee_id)
+        self._validate_common_references(
+            employee_id=resolved_employee_id,
+            project_id=payload.project_id,
+            task_id=payload.task_id,
+            user_id=payload.user_id,
+            check_task_project_pair=True,
+        )
+        payload_with_employee = payload.model_copy(update={"employee_id": resolved_employee_id})
+        entry_id = self._client.create_timesheet(payload_with_employee)
         record = self._client.get_timesheet(entry_id)
 
         if record is None:
@@ -38,7 +47,24 @@ class OdooTimesheetService:
         return self._map_record(record)
 
     def update_timesheet(self, entry_id: int, payload: TimesheetUpdate) -> TimesheetRead:
-        self._client.update_timesheet(entry_id, payload)
+        if not self._client.record_exists("account.analytic.line", entry_id):
+            raise ValueError(f"Timesheet entry_id {entry_id} does not exist in Odoo.")
+
+        update_payload = payload
+        if payload.employee_id is not None:
+            resolved_employee_id = self._resolve_employee_id(payload.employee_id)
+            update_payload = payload.model_copy(update={"employee_id": resolved_employee_id})
+
+        self._validate_common_references(
+            employee_id=update_payload.employee_id,
+            project_id=update_payload.project_id,
+            task_id=update_payload.task_id,
+            user_id=update_payload.user_id,
+            check_task_project_pair=(
+                update_payload.project_id is not None and update_payload.task_id is not None
+            ),
+        )
+        self._client.update_timesheet(entry_id, update_payload)
         record = self._client.get_timesheet(entry_id)
 
         if record is None:
@@ -48,14 +74,24 @@ class OdooTimesheetService:
 
     def list_timesheets(
         self,
-        employee_id: int,
+        employee_id: int | None,
         date_from=None,
         date_to=None,
     ) -> list[TimesheetRead]:
-        records = self._client.list_timesheets(employee_id, date_from, date_to)
+        resolved_employee_id = self._resolve_employee_id(employee_id)
+        records = self._client.list_timesheets(resolved_employee_id, date_from, date_to)
         return [self._map_record(record) for record in records]
 
     def fill_week(self, payload: TimesheetFillWeekRequest) -> TimesheetFillWeekResponse:
+        resolved_employee_id = self._resolve_employee_id(payload.employee_id)
+        self._validate_common_references(
+            employee_id=resolved_employee_id,
+            project_id=payload.project_id,
+            task_id=payload.task_id,
+            user_id=payload.user_id,
+            check_task_project_pair=True,
+        )
+
         created_entry_ids: list[int] = []
         updated_entry_ids: list[int] = []
         skipped_dates = []
@@ -63,7 +99,7 @@ class OdooTimesheetService:
         for weekday in payload.weekdays:
             entry_date = payload.week_start + timedelta(days=weekday)
             existing_entries = self._client.list_entries_for_day(
-                payload.employee_id,
+                resolved_employee_id,
                 entry_date,
                 payload.project_id,
                 payload.task_id,
@@ -88,7 +124,7 @@ class OdooTimesheetService:
                         description=description,
                         date=entry_date,
                         hours=payload.daily_hours,
-                        employee_id=payload.employee_id,
+                        employee_id=resolved_employee_id,
                         project_id=payload.project_id,
                         task_id=payload.task_id,
                         user_id=payload.user_id,
@@ -102,7 +138,7 @@ class OdooTimesheetService:
                     description=description,
                     date=entry_date,
                     hours=payload.daily_hours,
-                    employee_id=payload.employee_id,
+                    employee_id=resolved_employee_id,
                     project_id=payload.project_id,
                     task_id=payload.task_id,
                     user_id=payload.user_id,
@@ -115,6 +151,64 @@ class OdooTimesheetService:
             updated_entry_ids=updated_entry_ids,
             skipped_dates=skipped_dates,
         )
+
+    def _validate_common_references(
+        self,
+        employee_id: int | None,
+        project_id: int | None,
+        task_id: int | None,
+        user_id: int | None,
+        check_task_project_pair: bool = False,
+    ) -> None:
+        if employee_id is not None:
+            self._ensure_employee_exists(employee_id)
+        if project_id is not None:
+            self._ensure_project_exists(project_id)
+        if task_id is not None:
+            self._ensure_task_exists(task_id)
+        if user_id is not None:
+            self._ensure_user_exists(user_id)
+
+        if check_task_project_pair and project_id is not None and task_id is not None:
+            if not self._client.task_belongs_to_project(task_id, project_id):
+                raise ValueError(
+                    f"task_id {task_id} does not belong to project_id {project_id}."
+                )
+
+    def get_default_employee_id(self) -> int:
+        employee_id = self._client.get_current_employee_id()
+        self._ensure_employee_exists(employee_id)
+        return employee_id
+
+    def _resolve_employee_id(self, employee_id: int | None) -> int:
+        if employee_id is None:
+            return self.get_default_employee_id()
+        if self._client.record_exists("hr.employee", employee_id):
+            return employee_id
+
+        linked_employee_id = self._client.find_employee_id_by_user_id(employee_id)
+        if linked_employee_id is not None:
+            return linked_employee_id
+
+        raise ValueError(
+            f"employee_id {employee_id} does not exist in Odoo."
+        )
+
+    def _ensure_employee_exists(self, employee_id: int) -> None:
+        if not self._client.record_exists("hr.employee", employee_id):
+            raise ValueError(f"employee_id {employee_id} does not exist in Odoo.")
+
+    def _ensure_project_exists(self, project_id: int) -> None:
+        if not self._client.record_exists("project.project", project_id):
+            raise ValueError(f"project_id {project_id} does not exist in Odoo.")
+
+    def _ensure_task_exists(self, task_id: int) -> None:
+        if not self._client.record_exists("project.task", task_id):
+            raise ValueError(f"task_id {task_id} does not exist in Odoo.")
+
+    def _ensure_user_exists(self, user_id: int) -> None:
+        if not self._client.record_exists("res.users", user_id):
+            raise ValueError(f"user_id {user_id} does not exist in Odoo.")
 
     def resolve_project_id(self, query: str) -> tuple[int | None, list[dict]]:
         resolved_id, ranked = self._resolve_name_to_id(

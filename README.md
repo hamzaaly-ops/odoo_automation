@@ -30,6 +30,9 @@ Copy-Item services/timesheet-service/.env.example services/timesheet-service/.en
 - `ODOO_DB`
 - `ODOO_USERNAME`
 - `ODOO_PASSWORD`
+- `ODOO_EMPLOYEE_MODEL` (optional, default `hr.employee`)
+- `ODOO_EMPLOYEE_USER_FIELD` (optional, default `user_id`)
+- `TRANSCRIPTION_URL` (optional, defaults to `https://aqs-shispare-transcript-api.hf.space/voice`)
 - `LLM_PROVIDER` (`groq` or `gemini`, default is `groq`)
 - `GROQ_API_KEY` (required when `LLM_PROVIDER=groq`)
 - `GROQ_USER_AGENT` (optional override if Groq returns Cloudflare 1010)
@@ -51,7 +54,10 @@ API base URL: `http://localhost:8000`
 ### Timesheets
 - `POST /api/v1/timesheets`
 - `PUT /api/v1/timesheets/{entry_id}`
-- `GET /api/v1/timesheets?employee_id=1&date_from=2026-03-01&date_to=2026-03-31`
+- `GET /api/v1/timesheets?date_from=2026-03-01&date_to=2026-03-31` (`employee_id` optional)
+
+### Voice
+- `POST /voice` (multipart `file` forwarded to the configured transcription endpoint)
 
 ### Automation
 - `POST /api/v1/automation/fill-week` (async, Celery)
@@ -72,7 +78,6 @@ curl -X POST http://localhost:8000/api/v1/timesheets \
     "description": "Bug fixes",
     "date": "2026-03-02",
     "hours": 4,
-    "employee_id": 3,
     "project_id": 12,
     "task_id": 44,
     "user_id": 5
@@ -85,7 +90,6 @@ curl -X POST http://localhost:8000/api/v1/timesheets \
 curl -X POST http://localhost:8000/api/v1/automation/fill-week \
   -H "Content-Type: application/json" \
   -d '{
-    "employee_id": 3,
     "project_id": 12,
     "task_id": 44,
     "week_start": "2026-03-02",
@@ -109,7 +113,8 @@ curl -X POST http://localhost:8000/api/v1/chat/query \
   }'
 ```
 
-The API will return a `session_id` and ask for missing fields (like `employee_id`, `project_id`, `task_id`).
+The API will return a `session_id` and ask for missing fields (typically `project_id`, `task_id`, etc.).
+`employee_id` is auto-resolved from your authenticated Odoo user when possible.
 Use that exact `session_id` for every follow-up message in the same conversation.
 You can also provide names (for example project/task/employee names), and the service will try to resolve them to IDs.
 If names are misspelled, it applies fuzzy matching against your Odoo projects/tasks and uses the highest-confidence match.

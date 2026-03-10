@@ -77,6 +77,12 @@ ACTION_LABELS = {
     "fill_week": "fill a week of timesheets",
 }
 
+AUTO_EMPLOYEE_ACTIONS = {
+    "create_timesheet",
+    "list_timesheets",
+    "fill_week",
+}
+
 
 class ChatOrchestratorService:
     def __init__(
@@ -426,6 +432,10 @@ class ChatOrchestratorService:
     ) -> tuple[dict, dict[str, list[str]]]:
         resolved = dict(fields)
         hints: dict[str, list[str]] = {}
+        explicit_employee_input = any(
+            fields.get(key) not in (None, "", [])
+            for key in ["employee_id", "employee_name", "employee"]
+        )
 
         def resolve_field(
             field_key: str,
@@ -471,6 +481,15 @@ class ChatOrchestratorService:
             ["employee_name", "employee"],
             self._timesheet_service.resolve_employee_id,
         )
+        if (
+            action in AUTO_EMPLOYEE_ACTIONS
+            and not explicit_employee_input
+            and not isinstance(resolved.get("employee_id"), int)
+        ):
+            try:
+                resolved["employee_id"] = self._timesheet_service.get_default_employee_id()
+            except Exception:
+                pass
 
         resolve_field(
             "project_id",

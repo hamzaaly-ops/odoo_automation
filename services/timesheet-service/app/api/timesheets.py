@@ -45,7 +45,7 @@ def update_timesheet(
 
 @router.get("", response_model=TimesheetListResponse)
 def list_timesheets(
-    employee_id: int = Query(..., gt=0),
+    employee_id: int | None = Query(default=None, gt=0),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     service: OdooTimesheetService = Depends(get_timesheet_service),
