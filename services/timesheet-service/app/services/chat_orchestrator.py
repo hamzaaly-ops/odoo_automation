@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date as dt_date, timedelta
+import difflib
 import re
 from uuid import uuid4
 
@@ -83,6 +84,25 @@ AUTO_EMPLOYEE_ACTIONS = {
     "fill_week",
 }
 
+FIELD_KEY_ALIASES = {
+    "description": "description",
+    "descriptions": "description",
+    "employee": "employee",
+    "employees": "employee",
+    "project": "project",
+    "projects": "project",
+    "task": "task",
+    "tasks": "task",
+    "user": "user",
+    "users": "user",
+}
+
+FIELD_KEY_CANDIDATES = tuple(FIELD_KEY_ALIASES.keys())
+FIELD_KEY_PATTERN = re.compile(
+    r"^(?P<key>[\w-]+)\s*(?:id)?\s*(?:is|=|:)?\s*(?P<value>.+)$",
+    flags=re.IGNORECASE,
+)
+
 
 class ChatOrchestratorService:
     def __init__(
@@ -110,6 +130,7 @@ class ChatOrchestratorService:
         pending_action = state.get("pending_action")
         pending_fields = state.get("fields") or {}
         pending_hints = state.get("field_hints") or {}
+        pending_misses = state.get("field_misses") or {}
 
         if action == "none" and pending_action and incoming_fields:
             action = pending_action
@@ -122,6 +143,7 @@ class ChatOrchestratorService:
                     pending_action,
                     missing_fields,
                     pending_hints,
+                    pending_misses,
                 )
                 self._session_store.save_state(
                     session_id,
@@ -130,6 +152,7 @@ class ChatOrchestratorService:
                         "fields": merged_fields,
                         "missing_fields": missing_fields,
                         "field_hints": pending_hints,
+                        "field_misses": pending_misses,
                     },
                 )
                 return ChatQueryResponse(
@@ -166,7 +189,7 @@ class ChatOrchestratorService:
 
         merged_fields.update(incoming_fields)
         merged_fields = self._normalize_fields(merged_fields)
-        merged_fields, field_hints = self._resolve_reference_fields(action, merged_fields)
+        merged_fields, field_hints, field_misses = self._resolve_reference_fields(action, merged_fields)
 
         missing_fields = self._get_missing_fields(action, merged_fields)
         field_hints = self._augment_field_hints(
@@ -176,7 +199,12 @@ class ChatOrchestratorService:
             field_hints=field_hints,
         )
         if missing_fields:
-            question = self._build_follow_up_question(action, missing_fields, field_hints)
+            question = self._build_follow_up_question(
+                action,
+                missing_fields,
+                field_hints,
+                field_misses,
+            )
             self._session_store.save_state(
                 session_id,
                 {
@@ -184,6 +212,7 @@ class ChatOrchestratorService:
                     "fields": merged_fields,
                     "missing_fields": missing_fields,
                     "field_hints": field_hints,
+                    "field_misses": field_misses,
                 },
             )
             return ChatQueryResponse(
@@ -204,6 +233,7 @@ class ChatOrchestratorService:
                     "fields": merged_fields,
                     "missing_fields": [],
                     "field_hints": field_hints,
+                    "field_misses": field_misses,
                 },
             )
             return ChatQueryResponse(
@@ -398,16 +428,15 @@ class ChatOrchestratorService:
             if not segment:
                 continue
 
-            key_match = re.match(
-                r"^(employee|project|task|user|description)\s*(?:id)?\s*(?:is|=|:)?\s*(.+)$",
-                segment,
-                flags=re.IGNORECASE,
-            )
+            key_match = FIELD_KEY_PATTERN.match(segment)
             if not key_match:
                 continue
 
-            key = key_match.group(1).lower()
-            value = key_match.group(2).strip().strip(".")
+            key = self._normalize_field_label(key_match.group("key"))
+            if not key:
+                continue
+
+            value = key_match.group("value").strip().strip(".")
             value = re.sub(r"^(?:to\s+)+", "", value, flags=re.IGNORECASE)
             if not value:
                 continue
@@ -425,13 +454,49 @@ class ChatOrchestratorService:
 
         return extracted
 
+    @staticmethod
+    def _normalize_field_label(raw_key: str) -> str | None:
+        normalized = raw_key.strip().lower()
+        if not normalized:
+            return None
+
+        direct = FIELD_KEY_ALIASES.get(normalized)
+        if direct:
+            return direct
+
+        cleaned = re.sub(r"[^a-z0-9]+", "", normalized)
+        if cleaned.endswith("id") and len(cleaned) > 2:
+            cleaned = cleaned[:-2]
+
+        direct = FIELD_KEY_ALIASES.get(cleaned)
+        if direct:
+            return direct
+
+        tokens = [token for token in re.split(r"[^a-z0-9]+", normalized) if token]
+        for token in tokens:
+            direct = FIELD_KEY_ALIASES.get(token)
+            if direct:
+                return direct
+
+        candidate = difflib.get_close_matches(
+            cleaned or normalized,
+            FIELD_KEY_CANDIDATES,
+            n=1,
+            cutoff=0.7,
+        )
+        if candidate:
+            return FIELD_KEY_ALIASES.get(candidate[0])
+
+        return None
+
     def _resolve_reference_fields(
         self,
         action: str,
         fields: dict,
-    ) -> tuple[dict, dict[str, list[str]]]:
+    ) -> tuple[dict, dict[str, list[str]], dict[str, dict[str, list[str]]]]:
         resolved = dict(fields)
         hints: dict[str, list[str]] = {}
+        misses: dict[str, dict[str, list[str]]] = {}
         explicit_employee_input = any(
             fields.get(key) not in (None, "", [])
             for key in ["employee_id", "employee_name", "employee"]
@@ -475,6 +540,7 @@ class ChatOrchestratorService:
             formatted = self._format_candidates(candidates)
             if formatted:
                 hints[field_key] = formatted
+                misses[field_key] = {"value": lookup, "matches": formatted}
 
         resolve_field(
             "employee_id",
@@ -512,7 +578,7 @@ class ChatOrchestratorService:
         if action == "fill_week" and "daily_hours" not in resolved and "hours" in resolved:
             resolved["daily_hours"] = resolved.get("hours")
 
-        return resolved, hints
+        return resolved, hints, misses
 
     def _augment_field_hints(
         self,
@@ -611,6 +677,7 @@ class ChatOrchestratorService:
         action: str,
         missing_fields: list[str],
         field_hints: dict[str, list[str]] | None = None,
+        field_miss_info: dict[str, dict[str, list[str]]] | None = None,
     ) -> str:
         action_label = ACTION_LABELS.get(action, action)
         prompts = [FIELD_PROMPTS.get(field, field) for field in missing_fields]
@@ -631,9 +698,27 @@ class ChatOrchestratorService:
         for field in missing_fields:
             hints = field_hints.get(field)
             if hints:
-                hint_parts.append(f"{field}: {', '.join(hints)}")
+                label = FIELD_PROMPTS.get(field, field)
+                hint_parts.append(f"{label}: {', '.join(hints)}")
 
         if not hint_parts:
             return message
 
-        return f"{message} I found these matches: {' | '.join(hint_parts)}."
+        clarification_parts = []
+        if field_miss_info:
+            for field in missing_fields:
+                info = field_miss_info.get(field)
+                hints = field_hints.get(field)
+                if not hints or not info:
+                    continue
+                label = FIELD_PROMPTS.get(field, field)
+                raw_value = info.get("value")
+                if raw_value:
+                    clarification_parts.append(
+                        f"For {label} I heard \"{raw_value}\"; did you mean {', '.join(hints)}?"
+                    )
+
+        base_message = f"{message} I found these matches: {' | '.join(hint_parts)}."
+        if clarification_parts:
+            return f"{base_message} {' '.join(clarification_parts)} Did you mean one of them?"
+        return base_message
